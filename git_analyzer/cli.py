@@ -13,7 +13,7 @@ from rich.syntax import Syntax
 from openai import OpenAI
 from .analyzer import ASTAnalyzer
 from .embeddings import EmbeddingManager
-from typing import Dict
+from typing import Dict, Optional
 
 console = Console()
 
@@ -81,10 +81,15 @@ def code(query):
     click.secho("\nFinding relevant files...", fg='green')
     relevant_files = find_files(query)
     
-    # Filter files with score > 0.75 and sort by score
-    high_score_files = {f: s for f, s in relevant_files.items() if s > 0.70}
+    if not relevant_files:
+        click.secho("No files found. Try a different query or make sure you're in the correct directory.", fg='yellow')
+        return
+    
+    # Filter files with score > threshold and sort by score
+    threshold = 0.70
+    high_score_files = {f: s for f, s in relevant_files.items() if s > threshold}
     if not high_score_files:
-        click.secho("No highly relevant files found.", fg='yellow')
+        click.secho(f"No files found with similarity score above {threshold}. Try a different query.", fg='yellow')
         return
     
     # Display relevant files
@@ -105,6 +110,10 @@ def code(query):
                 }
         except Exception as e:
             click.secho(f"Error reading {file}: {str(e)}", fg='red')
+    
+    if not file_contents:
+        click.secho("Failed to read any files. Please check file permissions.", fg='red')
+        return
     
     # Generate execution plan
     click.secho("\nGenerating execution plan...", fg='green')
@@ -178,23 +187,35 @@ def _generate_execution_plan(query: str, file_contents: dict) -> str:
     except Exception as e:
         return f"Error generating plan: {str(e)}"
 
-def _generate_code_changes(query: str, file_path: str, current_content: str, execution_plan: str) -> str:
+def _generate_code_changes(query: str, file_path: str, current_content: str, execution_plan: str) -> Optional[str]:
     """Generate code changes based on the execution plan"""
-    client = OpenAI()
-    
     try:
+        client = OpenAI()
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a code generator. Given an execution plan and a file's current content, generate the updated code. Format your response as Python code."},
-                {"role": "user", "content": f"File: {file_path}\nCurrent content:\n{current_content}\n\nExecution plan:\n{execution_plan}"}
+                {"role": "system", "content": "You are a code generator. Given an execution plan and a file's current content, generate the updated code that implements the plan. Return ONLY the code, no explanations or markdown."},
+                {"role": "user", "content": f"Query: {query}\n\nFile: {file_path}\n\nCurrent content:\n```python\n{current_content}\n```\n\nExecution plan:\n{execution_plan}\n\nGenerate the updated Python code that implements this plan. Return ONLY the code, no explanations."}
             ],
             temperature=0.3,
             max_tokens=2000
         )
-        return response.choices[0].message.content
+        
+        generated_code = response.choices[0].message.content
+        
+        # Clean up the generated code
+        if generated_code.startswith("```python"):
+            generated_code = generated_code[10:]
+        if generated_code.startswith("```"):
+            generated_code = generated_code[3:]
+        if generated_code.endswith("```"):
+            generated_code = generated_code[:-3]
+            
+        return generated_code.strip()
+        
     except Exception as e:
-        return f"Error generating code changes: {str(e)}"
+        click.secho(f"Error generating code changes: {str(e)}", fg='red')
+        return None
 
 def _display_text_results(results):
     """Display results in text format"""
@@ -259,26 +280,49 @@ def find_files(query: str) -> Dict[str, float]:
         # Initialize embedding manager
         manager = EmbeddingManager()
         
-        # Get all Python files in current directory
+        # Get all Python files in current directory and subdirectories
         files = []
         for root, _, filenames in os.walk('.'):
+            if 'venv' in root or '.git' in root or '__pycache__' in root:
+                continue
             for filename in filenames:
-                if filename.endswith('.py'):
-                    files.append(os.path.join(root, filename))
+                if filename.endswith(('.py', '.js', '.ts', '.jsx', '.tsx')):
+                    abs_path = os.path.abspath(os.path.join(root, filename))
+                    try:
+                        with open(abs_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            if content.strip():  # Only include non-empty files
+                                files.append((abs_path, content))
+                    except Exception as e:
+                        click.secho(f"Error reading {abs_path}: {str(e)}", fg='red')
         
-        # Score each file
-        scores = {}
-        for file in files:
-            try:
-                with open(file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    score = manager.calculate_similarity(query, content)
-                    scores[file] = score
-            except Exception as e:
-                click.secho(f"Error reading {file}: {str(e)}", fg='red')
+        if not files:
+            click.secho("No source files found in the current directory.", fg='yellow')
+            return {}
+        
+        # Get embeddings for all files at once
+        try:
+            response = manager.client.embeddings.create(
+                model="text-embedding-ada-002",
+                input=[f"File: {os.path.basename(f)}\n\nContent:\n{content}" for f, content in files] + [query]
+            )
+            
+            # Get embeddings from response
+            file_embeddings = response.data[:-1]  # All but last are file embeddings
+            query_embedding = response.data[-1].embedding  # Last one is query embedding
+            
+            # Calculate similarity scores
+            scores = {}
+            for (file_path, _), file_data in zip(files, file_embeddings):
+                similarity = manager._cosine_similarity(query_embedding, file_data.embedding)
+                scores[file_path] = similarity
                 
-        return scores
-        
+            return scores
+            
+        except Exception as e:
+            click.secho(f"Error calculating similarities: {str(e)}", fg='red')
+            return {}
+                
     except Exception as e:
         click.secho(f"Error finding files: {str(e)}", fg='red')
         return {}
