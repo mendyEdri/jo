@@ -1,0 +1,2 @@
+[console_scripts]
+jo = git_analyzer.cli:cli
